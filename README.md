@@ -2,7 +2,7 @@ How it works
 
 Two ways to run it: a scriptable CLI (hairy_walls.py), or a desktop GUI (hairy_walls_gui.py) with file pickers, every parameter exposed as a labeled field with tooltips, and settings that persist between runs.
 
-Uses the filament painting feature of your slicer to selectively apply hair using virtual "hairy tools" remapped to one of your real tools. ex: adding a 2nd virtual "hairy tool" in slicer that remaps to use the same head on a single head printer (tool 0) or a 5th virtual tool remapped to tool 0-3 on up to a 4-head toolchanger with the gui (more tools supported in command line)
+Up to 4 independent tool slots — paint regions in your slicer to a tool number, and only those regions get fuzzed. Each slot can also remap to a different real toolhead, so up to 4 different filaments/colors of hair are possible on one model with the gui, single-hotend (tool 0) or true toolchanger (tool 0-3) alike
 
 It parses outer-wall toolpaths directly out of the sliced file (recognizing Cura, PrusaSlicer, SuperSlicer, and OrcaSlicer's type markers), figures out which way is "outward" from the model's own geometry, and inserts small
 filament extrusions along the wall at whatever spacing you set — without needing any information about the original 3D model. This can emulate the loops found on some hairy models, or with tuning can generate true straight
@@ -28,9 +28,6 @@ Selective application
 
 Restrict by Z-height range
 Skip tiny contours (holes, text) below a minimum length
-Up to 4 independent "paint-to-fuzz" tool slots — paint regions in your slicer to a tool number, and only those regions get fuzzed. Each slot can also remap to a different real toolhead, so up to 4 different filaments/colors of hair are possible on one model, single-hotend or true toolchanger alike
-
-Correctness under the hood
 
 Curved walls (arc-fitted G2/G3) are handled natively, not skipped
 Handles both absolute and relative extrusion modes, hides all injected filament from the rest of the file's E-accounting so nothing downstream breaks
