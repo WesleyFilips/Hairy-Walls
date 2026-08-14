@@ -2,7 +2,7 @@ How it works
 
 Two ways to run it: a scriptable CLI (hairy_walls.py), or a desktop GUI (hairy_walls_gui.py) with file pickers, every parameter exposed as a labeled field with tooltips, and settings that persist between runs.
 
-Uses the filament painting feature of your slice to selectively apply hair using virtual "hairy tools" remapped to one of your real tools (ex. adding a 5th hairy tool in slicer that you remap to tool 0 with the gui)
+Uses the filament painting feature of your slicer to selectively apply hair using virtual "hairy tools" remapped to one of your real tools. ex: adding a 2nd virtual "hairy tool" in slicer that remaps to use the same head on a single head printer (tool 0) or a 5th virtual tool remapped to tool 0-3 on up to a 4-head toolchanger with the gui (more tools supported in command line)
 
 It parses outer-wall toolpaths directly out of the sliced file (recognizing Cura, PrusaSlicer, SuperSlicer, and OrcaSlicer's type markers), figures out which way is "outward" from the model's own geometry, and inserts small
 filament extrusions along the wall at whatever spacing you set — without needing any information about the original 3D model. This can emulate the loops found on some hairy models, or with tuning can generate true straight
