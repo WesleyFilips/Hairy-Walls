@@ -36,6 +36,8 @@ except ImportError:
         "Download it and place both files together, then run this again.")
     sys.exit(1)
 
+import gcode3mf
+
 
 # (attribute name on the args object, label text, kind, default, help text)
 # kind is one of: float, int, optional_float, optional_int
@@ -311,23 +313,27 @@ class HairyWallsGUI(ttk.Frame):
     def _pick_input(self):
         path = filedialog.askopenfilename(
             title="Select a G-code file",
-            filetypes=[("G-code files", "*.gcode *.gco *.g"), ("All files", "*.*")])
+            filetypes=[("G-code / sliced plate", "*.gcode *.gco *.g *.3mf"), ("All files", "*.*")])
         if not path:
             return
         self.input_path.set(path)
         if not self.output_path.get():
-            base, ext = os.path.splitext(path)
+            base, ext = gcode3mf.split_ext(path)
             self.output_path.set(f"{base}_fuzzed{ext or '.gcode'}")
 
     def _pick_output(self):
         initial = self.output_path.get() or self.input_path.get()
         initdir = os.path.dirname(initial) if initial else None
         initfile = os.path.basename(initial) if initial else "output_fuzzed.gcode"
+        # follow whatever the input is, so a .gcode.3mf saves back as one
+        ext = gcode3mf.split_ext(self.input_path.get())[1] or '.gcode'
         path = filedialog.asksaveasfilename(
             title="Save fuzzed G-code as",
-            defaultextension=".gcode",
+            defaultextension=ext,
             initialdir=initdir, initialfile=initfile,
-            filetypes=[("G-code files", "*.gcode *.gco *.g"), ("All files", "*.*")])
+            filetypes=[("Bambu sliced plate", "*.gcode.3mf *.3mf"),
+                       ("G-code files", "*.gcode *.gco *.g"),
+                       ("All files", "*.*")])
         if path:
             self.output_path.set(path)
 
@@ -395,6 +401,15 @@ class HairyWallsGUI(ttk.Frame):
             messagebox.showerror("Check your inputs", str(e))
             return
 
+        if gcode3mf.is_3mf(args.output) and not gcode3mf.is_3mf(args.input):
+            messagebox.showerror(
+                "Can't save as .gcode.3mf",
+                "A sliced plate file also contains plate metadata, thumbnails and "
+                "the model, which can only be copied from an existing .gcode.3mf.\n\n"
+                "Either pick a .gcode.3mf as the input, or change the output to "
+                ".gcode.")
+            return
+
         self._save_settings()
 
         self.run_button.configure(state='disabled')
@@ -411,16 +426,14 @@ class HairyWallsGUI(ttk.Frame):
             before_skipped = hairy_walls.fuzzify_contour.stats_skipped
             before_contours = hairy_walls.fuzzify_contour.stats_contours
 
-            with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
+            lines = gcode3mf.read_lines(args.input)
 
             if args.avoid_collisions:
                 result = hairy_walls.process_collision_aware(lines, args)
             else:
                 result = hairy_walls.process(lines, args)
 
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.writelines(result)
+            gcode3mf.write_lines(args.output, result, args.input)
 
             loops = hairy_walls.fuzzify_contour.stats_loops - before_loops
             skipped = hairy_walls.fuzzify_contour.stats_skipped - before_skipped

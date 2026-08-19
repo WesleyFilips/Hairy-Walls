@@ -66,8 +66,8 @@ MOVE_RE = re.compile(r'^(G0|G1)\b', re.IGNORECASE)
 ARC_RE = re.compile(r'^(G2|G3)\b', re.IGNORECASE)
 COORD_RE = re.compile(r'([XYZEF])(-?[0-9.]+)', re.IGNORECASE)
 ARC_COORD_RE = re.compile(r'([XYZIJEF])(-?[0-9.]+)', re.IGNORECASE)
-TYPE_RE = re.compile(r';\s*TYPE\s*:\s*(.+)', re.IGNORECASE)
-LAYER_RE = re.compile(r';\s*LAYER\s*:', re.IGNORECASE)
+TYPE_RE = re.compile(r';\s*(?:TYPE|FEATURE)\s*:\s*(.+)', re.IGNORECASE)
+LAYER_RE = re.compile(r';\s*(?:LAYER|CHANGE_LAYER|LAYER_CHANGE)\b', re.IGNORECASE)
 TOOL_RE = re.compile(r'^T(\d+)\b', re.IGNORECASE)
 # same thing but anchored on the raw (unstripped) line, so a remap can
 # rewrite the tool number in place while preserving indentation/comments
