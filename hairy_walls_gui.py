@@ -23,6 +23,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hairy_walls_gui_settings.json')
+GUI_VERSION = "2.1.1"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -36,7 +37,12 @@ except ImportError:
         "Download it and place both files together, then run this again.")
     sys.exit(1)
 
-import gcode3mf
+CORE_VERSION = getattr(hairy_walls, '__version__', 'unknown')
+
+try:
+    import gcode3mf
+except ImportError:
+    gcode3mf = None
 
 
 # (attribute name on the args object, label text, kind, default, help text)
@@ -44,17 +50,26 @@ import gcode3mf
 FIELDS = [
     ('spacing', 'Spacing (mm)', 'float', 4.0,
      'Distance along the wall between the start of each loop.'),
-    ('length', 'Extrude length (mm)', 'float', 1.5,
+    ('length', 'Extrude length (mm)', 'float', 2.0,
      'How far each loop travels outward WHILE extruding.'),
-    ('dry_length', 'Dry length (mm)', 'float', 0.0,
+    ('dry_length', 'Dry length (mm)', 'float', 4.0,
      'Additional mm to keep traveling outward AFTER the extrude length, '
-     'with no extrusion -- a dry "whip" tip. 0 = old behavior (no dry tip).'),
+     'with no extrusion -- a dry "whip" tip. 0 disables it.'),
+    ('back_travel', 'Back-travel (mm)', 'float', 0.0,
+     'Drag the tip backward, toward the part, right after the extrude '
+     'leg but before retracting -- curls the still-soft tip into a hook '
+     '(hook-and-loop fastener hairs). Above 0 disables Dry length '
+     'entirely for this run, and changes where Return extrude applies '
+     '(see that field). 0 = off. Intended range: above 0, below Extrude '
+     'length.'),
     ('wall_thickness', 'Wall thickness (mm)', 'float', 0.0,
      'Reference thickness that Wall overlap is a percent of. Set to your '
      'actual wall thickness (line width x wall count) to make Wall '
      'overlap meaningful.'),
     ('wall_overlap', 'Wall overlap (%)', 'float', 0.0,
-     "How far inward from the wall's outer edge each hair's root starts, "
+     "Hair plugs mode only (ignored in Wall interrupt, where the hair "
+     "always starts exactly where the wall path paused). How far inward "
+     "from the wall's outer edge each hair's root starts, "
      'as a percent of Wall thickness: 0%% roots it right at the edge '
      '(default), 100%% roots it a full wall-thickness inward so the base '
      'is embedded in the wall. Outward length is unaffected.'),
@@ -64,44 +79,47 @@ FIELDS = [
      'Filament pushed out AT the wall, with no travel, before heading '
      'outward -- an anchor blob at the base of the hair. 0 = no root.'),
     ('return_extrude', 'Return extrude (mm)', 'float', 0.0,
-     'Extra filament pushed out during the return travel (0 = none, so '
-     'the return leg uses Dry feedrate).'),
-    ('retract', 'Retract (mm)', 'float', 0.0,
+     'Extra filament pushed during the return-to-wall travel (0 = none, '
+     'dry return). With Back-travel 0, this extrudes over the WHOLE '
+     'return trip. With Back-travel above 0, it extrudes only during '
+     'that backward leg at the tip -- the rest of the trip back stays '
+     'dry and retracted.'),
+    ('retract', 'Retract (mm)', 'float', 0.4,
      'Retract this much right after the extrude leg, before the dry '
      'travel and return -- cuts stringing. Automatically un-retracted by '
-     'the same amount once back at the wall. 0 = no retract.'),
+     'the same amount once back at the wall. 0 disables it.'),
     ('retract_feedrate', 'Retract feedrate (mm/min)', 'float', 2100.0,
      'Speed for the retract and un-retract moves.'),
-    ('extra_restart', 'Extra restart (mm)', 'float', 0.0,
+    ('extra_restart', 'Extra restart (mm)', 'float', 0.02,
      'Extra mm pushed during un-retract, on top of exactly restoring '
      'Retract -- helps rebuild melt pressure if the wall looks '
-     'under-extruded right after each hair. Try 0.02-0.1.'),
-    ('z_hop', 'Z-hop (mm)', 'float', 0.0,
+     'under-extruded right after each hair.'),
+    ('z_hop', 'Z-hop (mm)', 'float', 1.0,
      'Lift Z this much before traveling back from a hair tip to the wall '
      '(and between hairs in Hair plugs mode) so the nozzle clears what it '
-     'just printed. 0 = no hop.'),
+     'just printed. 0 disables it.'),
     ('z_hop_feedrate', 'Z-hop feedrate (mm/min)', 'float', 600.0,
      'Speed for the Z-hop up/down moves.'),
     ('feedrate', 'Extrude feedrate (mm/min)', 'float', 1200.0,
      'Speed for any move that is actively extruding: the outward extrude '
      'leg, and the return leg too if Return extrude is above 0.'),
-    ('dry_feedrate', 'Dry feedrate (mm/min)', 'optional_float', None,
+    ('dry_feedrate', 'Dry feedrate (mm/min)', 'optional_float', 2400.0,
      'Speed for any move that is NOT extruding: the outward dry leg, and '
      'the return leg when Return extrude is 0. Leave blank to match '
-     'Extrude feedrate.'),
+     'Extrude feedrate instead of using a fixed value.'),
     ('length_jitter', 'Length jitter (0-1)', 'float', 0.0,
      'Fractional random variation in loop length, e.g. 0.3 = +/-30%.'),
     ('angle_jitter', 'Angle jitter (deg)', 'float', 0.0,
      'Random rotation off perfectly perpendicular, for a less uniform look.'),
     ('seed', 'Random seed', 'int', 0,
      'Same seed always gives the same "random" pattern.'),
-    ('min_contour_length', 'Min contour length (mm)', 'float', 8.0,
+    ('min_contour_length', 'Min contour length (mm)', 'float', 1.0,
      'Skip outer-wall loops shorter than this (avoids tiny holes/text).'),
     ('min_z', 'Min Z (mm)', 'float', 0.0,
      'Only add loops at or above this height.'),
     ('max_z', 'Max Z (mm)', 'optional_float', None,
      'Only add loops at or below this height. Leave blank for no limit.'),
-    ('collision_margin', 'Collision margin (mm)', 'float', 0.0,
+    ('collision_margin', 'Collision margin (mm)', 'float', 1.0,
      'Minimum clearance a loop must keep from other toolpaths. '
      'Only used when "Avoid collisions" is checked.'),
 ]
@@ -123,8 +141,10 @@ class HairyWallsGUI(ttk.Frame):
 
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
-        self.random_phase = tk.BooleanVar(value=False)
-        self.avoid_collisions = tk.BooleanVar(value=False)
+        self.plate = tk.StringVar()
+        self.random_phase = tk.BooleanVar(value=True)
+        self.avoid_collisions = tk.BooleanVar(value=True)
+        self.fan_boost = tk.BooleanVar(value=True)
         self.mode = tk.StringVar(value='wall-interrupt')
         self.field_vars = {}
         # one (tool_var, remap_var) pair per fuzzy-tool slot
@@ -140,6 +160,11 @@ class HairyWallsGUI(ttk.Frame):
 
         self._load_settings()
 
+        self._log_line(f"Hairy Walls GUI {GUI_VERSION}  |  hairy_walls.py {CORE_VERSION}")
+        if CORE_VERSION != GUI_VERSION:
+            self._log_line(f"Note: GUI is {GUI_VERSION} but hairy_walls.py is {CORE_VERSION} -- "
+                            f"consider updating both files together to matching versions.")
+
     # -- layout ------------------------------------------------------
 
     def _build_file_row(self):
@@ -154,6 +179,14 @@ class HairyWallsGUI(ttk.Frame):
         ttk.Label(frame, text="Output .gcode:").grid(row=1, column=0, sticky='w', pady=2)
         ttk.Entry(frame, textvariable=self.output_path).grid(row=1, column=1, sticky='ew', padx=6)
         ttk.Button(frame, text="Browse...", command=self._pick_output).grid(row=1, column=2)
+
+        if gcode3mf is not None:
+            ttk.Label(frame, text="Plate (multi-plate .3mf only):").grid(row=2, column=0, sticky='w', pady=2)
+            plate_entry = ttk.Entry(frame, textvariable=self.plate, width=20)
+            plate_entry.grid(row=2, column=1, sticky='w', padx=6)
+            self._add_tooltip(plate_entry, "Only needed if the input .gcode.3mf has more "
+                                            "than one plate: enter a number (1, 2, ...) or "
+                                            "the exact archive path. Leave blank otherwise.")
 
     def _build_mode_row(self):
         frame = ttk.LabelFrame(self, text="Mode", padding=8)
@@ -222,6 +255,10 @@ class HairyWallsGUI(ttk.Frame):
                               variable=self.avoid_collisions)
         c2.pack(anchor='w')
 
+        c3 = ttk.Checkbutton(frame, text="Fan boost (max the part-cooling fan during each hair, then restore it)",
+                              variable=self.fan_boost)
+        c3.pack(anchor='w')
+
     def _build_run_row(self):
         frame = ttk.Frame(self)
         frame.pack(fill='x', pady=(0, 8))
@@ -277,6 +314,8 @@ class HairyWallsGUI(ttk.Frame):
             self.random_phase.set(bool(data['random_phase']))
         if 'avoid_collisions' in data:
             self.avoid_collisions.set(bool(data['avoid_collisions']))
+        if 'fan_boost' in data:
+            self.fan_boost.set(bool(data['fan_boost']))
         if 'mode' in data and data['mode'] in ('wall-interrupt', 'hair-plugs'):
             self.mode.set(data['mode'])
         if 'output_path' in data:
@@ -292,8 +331,10 @@ class HairyWallsGUI(ttk.Frame):
         data = {attr: var.get() for attr, (var, kind) in self.field_vars.items()}
         data['random_phase'] = self.random_phase.get()
         data['avoid_collisions'] = self.avoid_collisions.get()
+        data['fan_boost'] = self.fan_boost.get()
         data['mode'] = self.mode.get()
         data['output_path'] = self.output_path.get()
+        data['_gui_version'] = GUI_VERSION
         for i in range(FUZZY_TOOL_SLOTS):
             tool_var, remap_var = self.fuzzy_tool_vars[i]
             data[f'fuzzy_tool_{i + 1}'] = tool_var.get()
@@ -311,14 +352,15 @@ class HairyWallsGUI(ttk.Frame):
         self.log.configure(state='disabled')
 
     def _pick_input(self):
+        gcode_types = "*.gcode *.gco *.g *.3mf" if gcode3mf else "*.gcode *.gco *.g"
         path = filedialog.askopenfilename(
             title="Select a G-code file",
-            filetypes=[("G-code / sliced plate", "*.gcode *.gco *.g *.3mf"), ("All files", "*.*")])
+            filetypes=[("G-code / sliced plate", gcode_types), ("All files", "*.*")])
         if not path:
             return
         self.input_path.set(path)
         if not self.output_path.get():
-            base, ext = gcode3mf.split_ext(path)
+            base, ext = gcode3mf.split_ext(path) if gcode3mf else os.path.splitext(path)
             self.output_path.set(f"{base}_fuzzed{ext or '.gcode'}")
 
     def _pick_output(self):
@@ -326,14 +368,18 @@ class HairyWallsGUI(ttk.Frame):
         initdir = os.path.dirname(initial) if initial else None
         initfile = os.path.basename(initial) if initial else "output_fuzzed.gcode"
         # follow whatever the input is, so a .gcode.3mf saves back as one
-        ext = gcode3mf.split_ext(self.input_path.get())[1] or '.gcode'
+        if gcode3mf:
+            ext = gcode3mf.split_ext(self.input_path.get())[1] or '.gcode'
+        else:
+            ext = '.gcode'
+        filetypes = [("G-code files", "*.gcode *.gco *.g"), ("All files", "*.*")]
+        if gcode3mf:
+            filetypes.insert(0, ("Bambu sliced plate", "*.gcode.3mf *.3mf"))
         path = filedialog.asksaveasfilename(
             title="Save fuzzed G-code as",
             defaultextension=ext,
             initialdir=initdir, initialfile=initfile,
-            filetypes=[("Bambu sliced plate", "*.gcode.3mf *.3mf"),
-                       ("G-code files", "*.gcode *.gco *.g"),
-                       ("All files", "*.*")])
+            filetypes=filetypes)
         if path:
             self.output_path.set(path)
 
@@ -366,8 +412,10 @@ class HairyWallsGUI(ttk.Frame):
         args = Args()
         args.input = self.input_path.get()
         args.output = self.output_path.get()
+        args.plate = self.plate.get().strip() or None
         args.random_phase = self.random_phase.get()
         args.avoid_collisions = self.avoid_collisions.get()
+        args.fan_boost = self.fan_boost.get()
         args.mode = self.mode.get()
 
         for attr, label, kind, default, _tip in FIELDS:
@@ -401,7 +449,14 @@ class HairyWallsGUI(ttk.Frame):
             messagebox.showerror("Check your inputs", str(e))
             return
 
-        if gcode3mf.is_3mf(args.output) and not gcode3mf.is_3mf(args.input):
+        input_is_3mf = args.input.lower().endswith('.3mf')
+        output_is_3mf = args.output.lower().endswith('.3mf')
+        if (input_is_3mf or output_is_3mf) and gcode3mf is None:
+            messagebox.showerror(
+                "gcode3mf.py not found",
+                ".3mf input/output needs gcode3mf.py in the same folder as this GUI.")
+            return
+        if output_is_3mf and not input_is_3mf:
             messagebox.showerror(
                 "Can't save as .gcode.3mf",
                 "A sliced plate file also contains plate metadata, thumbnails and "
@@ -426,14 +481,22 @@ class HairyWallsGUI(ttk.Frame):
             before_skipped = hairy_walls.fuzzify_contour.stats_skipped
             before_contours = hairy_walls.fuzzify_contour.stats_contours
 
-            lines = gcode3mf.read_lines(args.input)
+            if gcode3mf is not None:
+                lines = gcode3mf.read_lines(args.input, plate=args.plate)
+            else:
+                with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
 
             if args.avoid_collisions:
                 result = hairy_walls.process_collision_aware(lines, args)
             else:
                 result = hairy_walls.process(lines, args)
 
-            gcode3mf.write_lines(args.output, result, args.input)
+            if gcode3mf is not None:
+                gcode3mf.write_lines(args.output, result, src=args.input, plate=args.plate)
+            else:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.writelines(result)
 
             loops = hairy_walls.fuzzify_contour.stats_loops - before_loops
             skipped = hairy_walls.fuzzify_contour.stats_skipped - before_skipped
@@ -442,11 +505,19 @@ class HairyWallsGUI(ttk.Frame):
             msg = f"Done: {loops} loops added across {contours} outer-wall contours"
             if args.avoid_collisions:
                 msg += f", {skipped} dropped to avoid collisions"
+            if args.output.lower().endswith('.3mf'):
+                msg += ("\nNote: cached print-time/filament estimates inside the .3mf "
+                        "were not recalculated and may now read low.")
             msg += f"\nSaved to {args.output}"
             self.master.after(0, self._on_success, msg)
+        except ValueError as e:
+            # our own validation errors (bad --plate, multi-plate archive,
+            # can't fabricate a .3mf, ...) -- show the full message, not a
+            # traceback, since these are expected/actionable, not bugs
+            self.master.after(0, self._on_failure, str(e), False)
         except Exception:
             err = traceback.format_exc()
-            self.master.after(0, self._on_failure, err)
+            self.master.after(0, self._on_failure, err, True)
 
     def _on_success(self, msg):
         self.progress.stop()
@@ -454,16 +525,17 @@ class HairyWallsGUI(ttk.Frame):
         self._log_line(msg)
         messagebox.showinfo("Done", msg)
 
-    def _on_failure(self, err):
+    def _on_failure(self, err, is_traceback):
         self.progress.stop()
         self.run_button.configure(state='normal')
         self._log_line("Error:\n" + err)
-        messagebox.showerror("Something went wrong", err.strip().splitlines()[-1])
+        shown = err.strip().splitlines()[-1] if is_traceback else err
+        messagebox.showerror("Something went wrong", shown)
 
 
 def main():
     root = tk.Tk()
-    root.title("Hairy Walls")
+    root.title(f"Hairy Walls v{GUI_VERSION}")
     root.geometry("700x760")
 
     # scrollable container: the window now has more sections than fit

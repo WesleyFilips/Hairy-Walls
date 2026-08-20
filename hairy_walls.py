@@ -62,6 +62,37 @@ import random
 import re
 import sys
 
+try:
+    import gcode3mf
+except ImportError:
+    gcode3mf = None
+
+__version__ = "2.1.1"
+# Changelog:
+#   2.1.1 - --return-extrude now interacts with --back-travel: with
+#           back-travel 0 (default) it still extrudes over the whole
+#           return-to-wall trip as before; with back-travel above 0, it
+#           extrudes only during that backward leg (right at the tip)
+#           instead, and the remaining trip back to the wall stays a
+#           dry, retracted move.
+#   2.1.0 - .gcode.3mf (Bambu/OrcaSlicer sliced-plate) support via the
+#           new gcode3mf.py module, wired into both the CLI (--plate for
+#           multi-plate archives) and the GUI. Also broadened TYPE/LAYER
+#           comment detection to include ;FEATURE: and ;CHANGE_LAYER
+#           alongside the existing ;TYPE:/;LAYER_CHANGE conventions.
+#   2.0.0 - new defaults that change behavior for existing command lines:
+#           min-contour-length 8->1, length 1.5->2, dry-length 0->4,
+#           z-hop 0->1, retract 0->0.4, extra-restart 0->0.02,
+#           dry-feedrate now a concrete 2400 instead of falling back to
+#           --feedrate, collision-margin 0->1, and random-phase /
+#           avoid-collisions / fan-boost now default ON (each has a new
+#           --no-<flag> to turn it back off).
+#   1.0.0 - first version-tagged release. Wall-interrupt and hair-plugs
+#           modes, arc support, collision avoidance, up to 4 independent
+#           fuzzy-tool/remap slots, root/retract/extra-restart/z-hop,
+#           dry-length, back-travel (hooks), wall-overlap (hair-plugs
+#           only), fan boost.
+
 MOVE_RE = re.compile(r'^(G0|G1)\b', re.IGNORECASE)
 ARC_RE = re.compile(r'^(G2|G3)\b', re.IGNORECASE)
 COORD_RE = re.compile(r'([XYZEF])(-?[0-9.]+)', re.IGNORECASE)
@@ -69,6 +100,9 @@ ARC_COORD_RE = re.compile(r'([XYZIJEF])(-?[0-9.]+)', re.IGNORECASE)
 TYPE_RE = re.compile(r';\s*(?:TYPE|FEATURE)\s*:\s*(.+)', re.IGNORECASE)
 LAYER_RE = re.compile(r';\s*(?:LAYER|CHANGE_LAYER|LAYER_CHANGE)\b', re.IGNORECASE)
 TOOL_RE = re.compile(r'^T(\d+)\b', re.IGNORECASE)
+FAN_ON_RE = re.compile(r'^M106\b', re.IGNORECASE)
+FAN_OFF_RE = re.compile(r'^M107\b', re.IGNORECASE)
+FAN_S_RE = re.compile(r'\bS(-?[0-9.]+)', re.IGNORECASE)
 # same thing but anchored on the raw (unstripped) line, so a remap can
 # rewrite the tool number in place while preserving indentation/comments
 TOOL_LINE_RE = re.compile(r'^(\s*T)(\d+)\b', re.IGNORECASE)
@@ -206,18 +240,27 @@ class Emitter:
 
 
 def fuzzify_contour(contour, params, mode_xyz_abs, mode_e_abs, rng,
-                     grid=None, own_contour_id=None):
+                     grid=None, own_contour_id=None, current_fan_speed=0.0):
     """Dispatches to the selected loop-placement mode. See
     _fuzzify_wall_interrupt (loops spliced into the wall path itself, as
     it prints) and _fuzzify_hair_plugs (wall prints normally first, then
     every loop for this contour is applied as a separate pass)."""
     if params.mode == 'hair-plugs':
-        return _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng, grid, own_contour_id)
-    return _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng, grid, own_contour_id)
+        return _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng, grid, own_contour_id,
+                                    current_fan_speed)
+    return _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng, grid, own_contour_id,
+                                    current_fan_speed)
+
+
+def fan_restore_line(speed):
+    """M106/M107 line that puts the fan back exactly where it was."""
+    if speed <= 0:
+        return "M107 ; hairy_walls: restore fan\n"
+    return f"M106 S{fmt(speed)} ; hairy_walls: restore fan\n"
 
 
 def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
-                             grid=None, own_contour_id=None):
+                             grid=None, own_contour_id=None, current_fan_speed=0.0):
     """contour: list of entries in original file order. Most are point dicts
     with absolute x,y,z,e,f,tool (e = original, fuzz-free extrusion target).
     Some may be {'marker': True, 'raw_line': ...} for a T-command that fell
@@ -312,11 +355,18 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
 
             # jitter scales the TOTAL outward reach (extrude leg + dry leg
             # together) so their ratio -- and so the look of the hair --
-            # stays consistent even as length varies loop to loop.
-            base_total = params.length + params.dry_length
+            # stays consistent even as length varies loop to loop. When
+            # back-travel is active, dry-length is disabled entirely (the
+            # tip goes backward toward the part instead of further out),
+            # so the whole reach is just the extrude leg.
+            back_travel_active = params.back_travel > 0
+            base_total = params.length if back_travel_active else (params.length + params.dry_length)
             jittered_total = base_total * (1.0 + rng.uniform(-params.length_jitter, params.length_jitter))
             jittered_total = max(jittered_total, 0.0)
-            extrude_ratio = (params.length / base_total) if base_total > 1e-9 else 1.0
+            if back_travel_active:
+                extrude_ratio = 1.0
+            else:
+                extrude_ratio = (params.length / base_total) if base_total > 1e-9 else 1.0
 
             angle = math.radians(rng.uniform(-params.angle_jitter, params.angle_jitter))
             onx = snx * math.cos(angle) - sny * math.sin(angle)
@@ -344,6 +394,9 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
             # move up to the split point along the (unmodified) wall path
             em.move('G1', split['x'], split['y'], split['z'], split['e'], split['f'])
 
+            if params.fan_boost:
+                em.lines.append("M106 S255 ; hairy_walls: fan boost\n")
+
             extrude_len = chosen_total * extrude_ratio
             dry_len = chosen_total - extrude_len
             dry_feedrate = params.dry_feedrate or params.feedrate
@@ -369,17 +422,38 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
             out_e = root_e + params.extrude
             em.move('G1', ext_x, ext_y, split['z'], out_e, params.feedrate, comment='fuzz out (extrude)')
 
+            last_x, last_y = ext_x, ext_y
+            travel_e = out_e
+            return_extrude_used = False
+
+            # back-travel: drag the tip backward toward the part, before
+            # retracting -- curls the still-soft tip into a hook shape
+            # (useful for hook-and-loop fastener hairs). Disables the dry
+            # leg for this loop when active. --return-extrude, if set, is
+            # extruded DURING this backward leg (over just the back-travel
+            # distance) instead of over the whole return-to-wall trip.
+            if back_travel_active:
+                last_x = ext_x - onx * params.back_travel
+                last_y = ext_y - ony * params.back_travel
+                if params.return_extrude > 0:
+                    travel_e = out_e + params.return_extrude
+                    em.move('G1', last_x, last_y, split['z'], travel_e, params.feedrate,
+                            comment='fuzz back-travel (hook, extruding)')
+                    return_extrude_used = True
+                else:
+                    em.move('G1', last_x, last_y, split['z'], travel_e, dry_feedrate,
+                            comment='fuzz back-travel (hook)')
+
             # retract: pull back before the non-extruding legs so they don't
             # ooze/string
-            travel_e = out_e
             if params.retract > 0:
-                travel_e = out_e - params.retract
-                em.move('G1', ext_x, ext_y, split['z'], travel_e, params.retract_feedrate,
+                travel_e = travel_e - params.retract
+                em.move('G1', last_x, last_y, split['z'], travel_e, params.retract_feedrate,
                         comment='fuzz retract')
 
-            # leg 2: continue outward, dry (only if there's a dry length to add)
-            last_x, last_y = ext_x, ext_y
-            if dry_len > 1e-9:
+            # leg 2: continue outward, dry (only if there's a dry length to
+            # add and back-travel isn't in play)
+            if not back_travel_active and dry_len > 1e-9:
                 last_x = split['x'] + onx * chosen_total
                 last_y = split['y'] + ony * chosen_total
                 em.move('G1', last_x, last_y, split['z'], travel_e, dry_feedrate, comment='fuzz out (dry)')
@@ -392,9 +466,12 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
                         comment='fuzz z-hop up')
 
             # leg 3: return to the split point, whole way in one move since
-            # both outward legs were collinear
-            back_e = travel_e + params.return_extrude
-            return_feedrate = params.feedrate if params.return_extrude > 0 else dry_feedrate
+            # both outward legs were collinear. --return-extrude was
+            # already spent during back-travel above (if that happened),
+            # so it isn't applied a second time here.
+            leftover_extrude = 0.0 if return_extrude_used else params.return_extrude
+            back_e = travel_e + leftover_extrude
+            return_feedrate = params.feedrate if leftover_extrude > 0 else dry_feedrate
             em.move('G1', split['x'], split['y'], return_z, back_e, return_feedrate, comment='fuzz back')
 
             if params.z_hop > 0:
@@ -408,6 +485,9 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
                 back_e = back_e + params.retract + params.extra_restart
                 em.move('G1', split['x'], split['y'], split['z'], back_e, params.retract_feedrate,
                         comment='fuzz unretract')
+
+            if params.fan_boost:
+                em.lines.append(fan_restore_line(current_fan_speed))
 
             # hide the extra filament from the absolute-E timeline so the
             # untouched remainder of the file is still correct
@@ -432,7 +512,7 @@ def _fuzzify_wall_interrupt(contour, params, mode_xyz_abs, mode_e_abs, rng,
 
 
 def _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng,
-                         grid=None, own_contour_id=None):
+                         grid=None, own_contour_id=None, current_fan_speed=0.0):
     """Prints the wall exactly as sliced (no interruptions), records where
     each hair would go along the way, then applies all of them as a
     separate pass once the wall is done -- travel to each spot, grow the
@@ -498,10 +578,14 @@ def _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng,
                 if (snx * (split['x'] - cx) + sny * (split['y'] - cy)) < 0:
                     snx, sny = -snx, -sny
 
-                base_total = params.length + params.dry_length
+                back_travel_active = params.back_travel > 0
+                base_total = params.length if back_travel_active else (params.length + params.dry_length)
                 jittered_total = base_total * (1.0 + rng.uniform(-params.length_jitter, params.length_jitter))
                 jittered_total = max(jittered_total, 0.0)
-                extrude_ratio = (params.length / base_total) if base_total > 1e-9 else 1.0
+                if back_travel_active:
+                    extrude_ratio = 1.0
+                else:
+                    extrude_ratio = (params.length / base_total) if base_total > 1e-9 else 1.0
 
                 angle = math.radians(rng.uniform(-params.angle_jitter, params.angle_jitter))
                 onx = snx * math.cos(angle) - sny * math.sin(angle)
@@ -568,6 +652,9 @@ def _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng,
                     comment='fuzz unretract')
             is_retracted = False
 
+        if params.fan_boost:
+            em.lines.append("M106 S255 ; hairy_walls: fan boost\n")
+
         extrude_len = chosen_total * extrude_ratio
         dry_len = chosen_total - extrude_len
 
@@ -580,13 +667,32 @@ def _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng,
         e_now = e_now + params.extrude
         em.move('G1', ext_x, ext_y, split['z'], e_now, params.feedrate, comment='fuzz out (extrude)')
 
+        last_x, last_y = ext_x, ext_y
+        return_extrude_used = False
+
+        # back-travel: drag the tip backward toward the part, before
+        # retracting -- curls the still-soft tip into a hook shape.
+        # Disables the dry leg for this loop when active. --return-extrude,
+        # if set, is extruded DURING this backward leg (over just the
+        # back-travel distance) instead of over the whole return trip.
+        if params.back_travel > 0:
+            last_x = ext_x - onx * params.back_travel
+            last_y = ext_y - ony * params.back_travel
+            if params.return_extrude > 0:
+                e_now = e_now + params.return_extrude
+                em.move('G1', last_x, last_y, split['z'], e_now, params.feedrate,
+                        comment='fuzz back-travel (hook, extruding)')
+                return_extrude_used = True
+            else:
+                em.move('G1', last_x, last_y, split['z'], e_now, dry_feedrate,
+                        comment='fuzz back-travel (hook)')
+
         if params.retract > 0:
             e_now = e_now - params.retract
-            em.move('G1', ext_x, ext_y, split['z'], e_now, params.retract_feedrate, comment='fuzz retract')
+            em.move('G1', last_x, last_y, split['z'], e_now, params.retract_feedrate, comment='fuzz retract')
             is_retracted = True
 
-        last_x, last_y = ext_x, ext_y
-        if dry_len > 1e-9:
+        if params.back_travel <= 0 and dry_len > 1e-9:
             last_x = split['x'] + onx * chosen_total
             last_y = split['y'] + ony * chosen_total
             em.move('G1', last_x, last_y, split['z'], e_now, dry_feedrate, comment='fuzz out (dry)')
@@ -596,13 +702,19 @@ def _fuzzify_hair_plugs(contour, params, mode_xyz_abs, mode_e_abs, rng,
             return_z = split['z'] + params.z_hop
             em.move('G1', last_x, last_y, return_z, e_now, params.z_hop_feedrate, comment='fuzz z-hop up')
 
-        e_now = e_now + params.return_extrude
-        return_feedrate = params.feedrate if params.return_extrude > 0 else dry_feedrate
+        # --return-extrude was already spent during back-travel above (if
+        # that happened), so it isn't applied a second time here.
+        leftover_extrude = 0.0 if return_extrude_used else params.return_extrude
+        e_now = e_now + leftover_extrude
+        return_feedrate = params.feedrate if leftover_extrude > 0 else dry_feedrate
         em.move('G1', split['x'], split['y'], return_z, e_now, return_feedrate, comment='fuzz back')
 
         if params.z_hop > 0:
             em.move('G1', split['x'], split['y'], split['z'], e_now, params.z_hop_feedrate,
                     comment='fuzz z-hop down')
+
+        if params.fan_boost:
+            em.lines.append(fan_restore_line(current_fan_speed))
 
         fuzzify_contour.stats_loops += 1
 
@@ -751,6 +863,7 @@ def process(lines, params):
     in_outer_wall = False
     z_in_range = True
     current_tool = 0
+    current_fan_speed = 0.0
     contour = []
 
     def flush():
@@ -758,7 +871,8 @@ def process(lines, params):
         if not contour:
             return
         if z_in_range:
-            out.extend(fuzzify_contour(contour, params, mode_xyz_abs, mode_e_abs, rng))
+            out.extend(fuzzify_contour(contour, params, mode_xyz_abs, mode_e_abs, rng,
+                                        current_fan_speed=current_fan_speed))
         else:
             out.extend(p['raw_line'] for p in contour if p.get('raw_line'))
         contour = []
@@ -774,8 +888,20 @@ def process(lines, params):
             out.append(line)
             continue
 
-        if LAYER_RE.match(stripped) or stripped.upper().startswith(';LAYER_CHANGE'):
+        if LAYER_RE.match(stripped):
             flush()
+            out.append(line)
+            continue
+
+        if FAN_ON_RE.match(stripped):
+            flush()
+            sm = FAN_S_RE.search(stripped)
+            current_fan_speed = float(sm.group(1)) if sm else 255.0
+            out.append(line)
+            continue
+        if FAN_OFF_RE.match(stripped):
+            flush()
+            current_fan_speed = 0.0
             out.append(line)
             continue
 
@@ -906,7 +1032,7 @@ def split_into_layers(lines):
     (rare, but keeps --avoid-collisions correct rather than silently
     doing nothing on an unusual file -- just slower on that one file)."""
     boundaries = [i for i, line in enumerate(lines)
-                  if LAYER_RE.match(line.strip()) or line.strip().upper().startswith(';LAYER_CHANGE')]
+                  if LAYER_RE.match(line.strip())]
     if not boundaries:
         return [lines]
     chunks = []
@@ -930,6 +1056,7 @@ def simulate_chunk(chunk_lines, state, params, grid):
 
     out_template = []
     wall_contours = {}
+    contour_fan_speed = {}
     next_id = [0]
     fuzzy_map = get_fuzzy_map(params)
 
@@ -937,6 +1064,7 @@ def simulate_chunk(chunk_lines, state, params, grid):
     mode_e_abs = state['mode_e_abs']
     cur = dict(state['cur'])
     current_tool = state['tool']
+    current_fan_speed = state.get('fan_speed', 0.0)
     in_outer_wall = False
     z_in_range = True
     contour = []
@@ -953,6 +1081,7 @@ def simulate_chunk(chunk_lines, state, params, grid):
             return
         cid = contour_id[0]
         wall_contours[cid] = contour
+        contour_fan_speed[cid] = current_fan_speed
         out_template.append(('contour', cid))
         contour = []
         contour_id[0] = None
@@ -970,6 +1099,18 @@ def simulate_chunk(chunk_lines, state, params, grid):
             flush()
             t = m.group(1).lower()
             in_outer_wall = any(k in t for k in OUTER_WALL_KEYWORDS)
+            out_template.append(('raw', line))
+            continue
+
+        if FAN_ON_RE.match(stripped):
+            flush()
+            sm = FAN_S_RE.search(stripped)
+            current_fan_speed = float(sm.group(1)) if sm else 255.0
+            out_template.append(('raw', line))
+            continue
+        if FAN_OFF_RE.match(stripped):
+            flush()
+            current_fan_speed = 0.0
             out_template.append(('raw', line))
             continue
 
@@ -1096,8 +1237,8 @@ def simulate_chunk(chunk_lines, state, params, grid):
     flush()
 
     new_state = {'mode_xyz_abs': mode_xyz_abs, 'mode_e_abs': mode_e_abs,
-                 'cur': cur, 'tool': current_tool}
-    return out_template, wall_contours, new_state
+                 'cur': cur, 'tool': current_tool, 'fan_speed': current_fan_speed}
+    return out_template, wall_contours, contour_fan_speed, new_state
 
 
 def process_collision_aware(lines, params):
@@ -1105,17 +1246,18 @@ def process_collision_aware(lines, params):
     cell_size = max(params.length * 2.0, 2.0)
 
     state = {'mode_xyz_abs': True, 'mode_e_abs': True,
-             'cur': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'e': 0.0, 'f': 0.0}, 'tool': 0}
+             'cur': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'e': 0.0, 'f': 0.0}, 'tool': 0, 'fan_speed': 0.0}
 
     out = []
     for chunk in split_into_layers(lines):
         grid = SegGrid(cell_size)
-        out_template, wall_contours, state = simulate_chunk(chunk, state, params, grid)
+        out_template, wall_contours, contour_fan_speed, state = simulate_chunk(chunk, state, params, grid)
 
         fuzzed = {}
         for cid, contour in wall_contours.items():
             fuzzed[cid] = fuzzify_contour(contour, params, state['mode_xyz_abs'], state['mode_e_abs'],
-                                           rng, grid=grid, own_contour_id=cid)
+                                           rng, grid=grid, own_contour_id=cid,
+                                           current_fan_speed=contour_fan_speed.get(cid, 0.0))
 
         for kind, payload in out_template:
             if kind == 'raw':
@@ -1134,8 +1276,15 @@ def build_arg_parser():
     p = argparse.ArgumentParser(
         prog='hairy_walls.py',
         description="Hairy Walls -- add outward filament fuzz/hair loops along outer wall perimeters.")
-    p.add_argument('input', help="source .gcode file")
-    p.add_argument('output', help="destination .gcode file")
+    p.add_argument('--version', action='version', version=f"hairy_walls.py {__version__}")
+    p.add_argument('input', help="source .gcode file, or a Bambu .gcode.3mf sliced plate")
+    p.add_argument('output', help="destination .gcode file, or .gcode.3mf (only when the "
+                                   "input is also a .gcode.3mf -- see gcode3mf.py)")
+    p.add_argument('--plate', default=None,
+                    help="which plate to use inside a multi-plate .gcode.3mf -- a number "
+                         "(1, 2, ...) or the exact archive path (e.g. "
+                         "Metadata/plate_2.gcode). Only needed if the archive has more "
+                         "than one plate; ignored for plain .gcode files")
 
     p.add_argument('--mode', choices=['wall-interrupt', 'hair-plugs'], default='wall-interrupt',
                     help="wall-interrupt (default): pause the wall path at each spot and "
@@ -1143,24 +1292,35 @@ def build_arg_parser():
                          "hair-plugs: print each wall exactly as sliced first, then go "
                          "back afterward and apply every hair for that wall as a "
                          "separate pass")
-    p.add_argument('--z-hop', type=float, default=0.0,
+    p.add_argument('--z-hop', type=float, default=1.0,
                     help="mm to lift Z before traveling back from the tip of a hair to "
                          "the wall (and, in hair-plugs mode, between hairs too) so the "
                          "nozzle doesn't drag through what it just printed "
-                         "(default 0, no hop)")
+                         "(default 1.0, 0 disables)")
     p.add_argument('--z-hop-feedrate', type=float, default=600,
                     help="mm/min for the Z-hop up/down moves (default 600)")
 
     p.add_argument('--spacing', type=float, default=4.0,
                     help="mm of wall between the start of each loop (default 4)")
-    p.add_argument('--length', type=float, default=1.5,
+    p.add_argument('--length', type=float, default=2.0,
                     help="mm to travel outward WHILE EXTRUDING, i.e. the length of "
-                         "filament that actually gets laid down (default 1.5)")
-    p.add_argument('--dry-length', type=float, default=0.0,
+                         "filament that actually gets laid down (default 2.0)")
+    p.add_argument('--dry-length', type=float, default=4.0,
                     help="additional mm to keep traveling outward AFTER --length, "
                          "with no extrusion -- lets the very tip of the hair be a "
                          "dry whip rather than filament the whole way out "
-                         "(default 0, matching the old behavior)")
+                         "(default 4.0, 0 disables)")
+    p.add_argument('--back-travel', type=float, default=0.0,
+                    help="mm to drag the tip backward, toward the part, right after "
+                         "the extrude leg but before retracting -- curls the still-soft "
+                         "tip into a hook shape, useful for hook-and-loop fastener "
+                         "hairs. A value above 0 disables --dry-length entirely for "
+                         "this run: the sequence becomes extrude outward, back-travel, "
+                         "retract, return to the wall, un-retract, resume. When active, "
+                         "--return-extrude (if set) is extruded DURING this backward "
+                         "leg instead of over the whole return trip -- see "
+                         "--return-extrude. Intended range is above 0 and below "
+                         "--length (default 0, no back-travel)")
     p.add_argument('--wall-thickness', type=float, default=0.0,
                     help="mm, the reference thickness --wall-overlap is a percentage "
                          "of. Set this to your actual wall thickness (line width x "
@@ -1187,46 +1347,56 @@ def build_arg_parser():
                          "before heading outward -- gives the hair a small anchor "
                          "blob at its base (default 0, no root blob)")
     p.add_argument('--return-extrude', type=float, default=0.0,
-                    help="extra E to push during the return travel, e.g. for a "
+                    help="extra E to push during the return-to-wall travel, e.g. for a "
                          "slightly thicker/blobby tip (default 0 -- return is a dry "
-                         "move unless you set this)")
-    p.add_argument('--retract', type=float, default=0.0,
+                         "move unless you set this). With --back-travel 0 (default) "
+                         "this extrudes over the WHOLE return trip, tip to wall. With "
+                         "--back-travel above 0, it instead extrudes only over that "
+                         "back-travel distance, right at the tip -- the remainder of "
+                         "the trip back to the wall stays a dry, retracted move")
+    p.add_argument('--retract', type=float, default=0.4,
                     help="mm to retract right after the outward extrude leg, before "
                          "the dry travel and return -- cuts stringing/oozing on the "
                          "parts of the loop that aren't meant to extrude. "
                          "Automatically un-retracted by the same amount once back at "
-                         "the wall, before resuming the path (default 0, no retract)")
+                         "the wall, before resuming the path (default 0.4, 0 disables)")
     p.add_argument('--retract-feedrate', type=float, default=2100,
                     help="mm/min for the retract and un-retract moves (default 2100)")
-    p.add_argument('--extra-restart', type=float, default=0.0,
+    p.add_argument('--extra-restart', type=float, default=0.02,
                     help="extra mm pushed during the un-retract, on top of exactly "
                          "restoring --retract -- real nozzles need a bit more than "
                          "the exact retracted distance back to rebuild melt pressure, "
                          "so if the wall looks under-extruded right after each hair, "
                          "raise this a little (try 0.02-0.1mm) instead of dropping "
-                         "--retract (default 0)")
+                         "--retract (default 0.02)")
     p.add_argument('--feedrate', type=float, default=1200,
                     help="mm/min for any move that's actively extruding -- the "
                          "outward --length travel, and the return travel too if "
                          "--return-extrude is set above 0 (default 1200)")
-    p.add_argument('--dry-feedrate', type=float, default=None,
+    p.add_argument('--dry-feedrate', type=float, default=2400,
                     help="mm/min for any move that's NOT extruding -- the outward "
                          "--dry-length travel, and the return travel when "
-                         "--return-extrude is 0 (default: same as --feedrate)")
+                         "--return-extrude is 0 (default 2400)")
 
     p.add_argument('--length-jitter', type=float, default=0.0,
                     help="fractional random variation in loop length, 0-1 (default 0)")
     p.add_argument('--angle-jitter', type=float, default=0.0,
                     help="+/- degrees of random rotation off the pure perpendicular, "
                          "for a less uniform 'hairy' look (default 0)")
-    p.add_argument('--random-phase', action='store_true',
+    p.add_argument('--random-phase', action=argparse.BooleanOptionalAction, default=True,
                     help="randomize where the first loop of each contour starts, "
-                         "instead of always spacing/2")
+                         "instead of always spacing/2 (default on; use "
+                         "--no-random-phase to turn off)")
+    p.add_argument('--fan-boost', action=argparse.BooleanOptionalAction, default=True,
+                    help="max the part-cooling fan (M106 S255) right before each hair "
+                         "forms, then set it back to whatever it was (tracked from the "
+                         "M106/M107 commands already in the file) right after "
+                         "(default on; use --no-fan-boost to turn off)")
     p.add_argument('--seed', type=int, default=0, help="random seed (default 0)")
 
-    p.add_argument('--min-contour-length', type=float, default=8.0,
+    p.add_argument('--min-contour-length', type=float, default=1.0,
                     help="skip outer-wall contours shorter than this, in mm "
-                         "(default 8 - avoids tiny holes/text getting loops)")
+                         "(default 1 - avoids tiny holes/text getting loops)")
     p.add_argument('--min-z', type=float, default=0.0,
                     help="only add loops at/above this Z height, mm (default 0)")
     p.add_argument('--max-z', type=float, default=float('inf'),
@@ -1249,16 +1419,16 @@ def build_arg_parser():
     p.add_argument('--fuzzy-tool-4', type=int, default=None, help="4th fuzzy-tool slot")
     p.add_argument('--remap-tool-4-to', type=int, default=None, help="remap target for slot 4")
 
-    p.add_argument('--avoid-collisions', action='store_true',
+    p.add_argument('--avoid-collisions', action=argparse.BooleanOptionalAction, default=True,
                     help="check each candidate loop against every other toolpath in "
                          "the same layer (other walls, infill, skin, support, ...) "
                          "and shrink or drop it rather than let it cross one. Slower "
-                         "and uses more memory than the default (buffers a full "
-                         "layer at a time instead of streaming) -- opt in when hairs "
-                         "are landing on top of nearby geometry")
-    p.add_argument('--collision-margin', type=float, default=0.0,
+                         "and uses more memory than streaming (buffers a full layer at "
+                         "a time) -- default on; use --no-avoid-collisions for the "
+                         "faster streaming path if you don't need it")
+    p.add_argument('--collision-margin', type=float, default=1.0,
                     help="minimum clearance, in mm, a loop must keep from any other "
-                         "toolpath; 0 only rejects an actual crossing (default 0, "
+                         "toolpath; 0 only rejects an actual crossing (default 1.0, "
                          "only used with --avoid-collisions)")
 
     return p
@@ -1275,20 +1445,47 @@ def main(argv=None):
                   f"be set (nothing to remap otherwise)", file=sys.stderr)
             sys.exit(1)
 
-    with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
-        lines = f.readlines()
+    input_is_3mf = args.input.lower().endswith('.3mf')
+    output_is_3mf = args.output.lower().endswith('.3mf')
+    if (input_is_3mf or output_is_3mf) and gcode3mf is None:
+        print("hairy_walls: gcode3mf.py is required for .3mf input/output but wasn't "
+              "found -- make sure it's in the same folder as hairy_walls.py",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        if gcode3mf is not None:
+            lines = gcode3mf.read_lines(args.input, plate=args.plate)
+        else:
+            with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+    except (ValueError, OSError) as e:
+        print(f"hairy_walls: couldn't read {args.input}: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.avoid_collisions:
         result = process_collision_aware(lines, args)
     else:
         result = process(lines, args)
 
-    with open(args.output, 'w', encoding='utf-8') as f:
-        f.writelines(result)
+    try:
+        if gcode3mf is not None:
+            gcode3mf.write_lines(args.output, result, src=args.input, plate=args.plate)
+        else:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.writelines(result)
+    except (ValueError, OSError) as e:
+        print(f"hairy_walls: couldn't write {args.output}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if output_is_3mf:
+        print("hairy_walls: note -- cached print-time/filament-usage estimates inside "
+              "the .3mf project were not recalculated and may now read low, since this "
+              "adds material the original slice didn't account for.", file=sys.stderr)
 
     skip_note = (f", {fuzzify_contour.stats_skipped} dropped (no collision-free length found)"
                  if args.avoid_collisions else "")
-    print(f"hairy_walls: {fuzzify_contour.stats_loops} loops added across "
+    print(f"hairy_walls {__version__}: {fuzzify_contour.stats_loops} loops added across "
           f"{fuzzify_contour.stats_contours} outer-wall contours{skip_note} "
           f"-> {args.output}", file=sys.stderr)
 
